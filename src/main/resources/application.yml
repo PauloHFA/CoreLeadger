@@ -1,0 +1,94 @@
+spring:
+  application:
+    name: coreledger-engine
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/coreledger}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASS:postgres}
+    hikari:
+      maximum-pool-size: 30
+      connection-timeout: 5000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  rabbitmq:
+    host: ${RABBIT_HOST:localhost}
+    port: ${RABBIT_PORT:5672}
+    username: ${RABBIT_USER:guest}
+    password: ${RABBIT_PASS:guest}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+        default-requeue-rejected: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWKS_URI:http://localhost:9000/.well-known/jwks.json}
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+coreledger:
+  acquirer:
+    base-url: ${ACQUIRER_URL:http://localhost:9100}
+    connect-timeout: 1s
+    read-timeout: 2s
+  outbox:
+    poll-ms: 1000
+    batch-size: 50
+  lock:
+    wait-seconds: 15
+    lease-seconds: 30
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      acquirerGateway:
+        slidingWindowSize: 20
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 5
+  retry:
+    instances:
+      acquirerGateway:
+        maxAttempts: 3
+        waitDuration: 400ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        ignoreExceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
