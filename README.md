@@ -1,143 +1,249 @@
 # CoreLedger — Motor Distribuído de Pagamentos e Conciliação Contábil
 
-Backend financeiro crítico de alta performance e resiliência desenvolvido em **Java 21** e **Spring Boot 3.3+**, projetado para liquidações por **partidas dobradas (double-entry bookkeeping)**, garantia estrita de **idempotência**, **prevenção contra gasto duplo**, **rastreamento distribuído** e **tolerância a falhas**.
+Plataforma financeira de missão crítica desenvolvida em **Java 21** e **Spring Boot 3.3.5**, projetada para liquidações por **partidas dobradas (double-entry bookkeeping)**, garantia estrita de **idempotência**, **prevenção contra condições de corrida**, **tolerância a falhas** e **observabilidade ponta a ponta**.
 
 ---
 
-## 🏛️ Arquitetura e Decisões de Engenharia
+## 🧭 Sumário Rápido
+1. [Visão Geral da Arquitetura](#-visão-geral-da-arquitetura)
+2. [Matriz Tecnológica](#-matriz-tecnológica)
+3. [Catálogo de Endpoints da API](#-catálogo-de-endpoints-da-api)
+4. [Como Executar Localmente](#-como-executar-localmente)
+5. [Como Testar no Swagger UI (com JWT Local)](#-como-testar-no-swagger-ui-com-jwt-local)
+6. [Exemplos Práticos com cURL](#-exemplos-práticos-com-curl)
+7. [Pilares de Engenharia & Decisões de Design](#-pilares-de-engenharia--decisões-de-design)
+8. [Estratégia e Execução de Testes](#-estratégia-e-execução-de-testes)
+
+---
+
+## 🏛️ Visão Geral da Arquitetura
 
 ```
-                                      [Cliente HTTP / Gateway]
-                                                 │
-                                                 ▼ (JWT com SCOPE_payment:write)
-                                     ┌───────────────────────┐
-                                     │  IdempotencyAspect    │ ◄───► [Redis / SETNX (24h TTL)]
-                                     └───────────┬───────────┘
-                                                 │
-                                                 ▼
-                                     ┌───────────────────────┐
-                                     │ TransferOrchestrator  │ ◄───► [Redisson Lock por Conta]
-                                     └─────┬───────────┬─────┘       [Resilience4j CB / Adquirente]
-                                           │           │
-                     ┌─────────────────────┘           └───────────────────────┐
-                     ▼                                                         ▼
-         ┌────────────────────────┐                                ┌─────────────────────────┐
-         │  LedgerTransferService │                                │  AcquirerGatewayClient  │
-         │     (@Transactional)   │                                │  (Circuit Breaker +     │
-         └───────────┬────────────┘                                │   Retry + Timeout 2s)   │
-                     │                                             └─────────────────────────┘
-         ┌───────────┴───────────────────────────────┐
-         │               PostgreSQL                  │
-         │  - accounts (@Version + PESSIMISTIC_WRITE)│
-         │  - transactions                           │
-         │  - ledger_entries (DEBIT + CREDIT)        │
-         │  - outbox_events (PENDING)                │
-         └───────────────────┬───────────────────────┘
-                             │ (Poll com FOR UPDATE SKIP LOCKED)
-                             ▼
-                  ┌─────────────────────┐
-                  │   OutboxPublisher   │ ───► [RabbitMQ Exchange: coreledger.events]
-                  └─────────────────────┘               │
-                                                        ▼
-                                             [Queue: coreledger.events.queue]
-                                             (DLQ: coreledger.events.dlq)
+                                  [Cliente HTTP / Gateway]
+                                             │
+                                             ▼ (Bearer JWT com SCOPE_payment:write)
+                                 ┌───────────────────────┐
+                                 │  IdempotencyAspect    │ ◄───► [Redis / SETNX (24h TTL)]
+                                 └───────────┬───────────┘
+                                             │
+                                             ▼
+                                 ┌───────────────────────┐
+                                 │ TransferOrchestrator  │ ◄───► [Redisson Lock por Conta]
+                                 └─────┬───────────┬─────┘       [Resilience4j CB / Adquirente]
+                                       │           │
+                 ┌─────────────────────┘           └───────────────────────┐
+                 ▼                                                         ▼
+     ┌────────────────────────┐                                ┌─────────────────────────┐
+     │  LedgerTransferService │                                │  AcquirerGatewayClient  │
+     │     (@Transactional)   │                                │  (Circuit Breaker +     │
+     └───────────┬────────────┘                                │   Retry + Timeout 2s)   │
+                 │                                             └─────────────────────────┘
+     ┌───────────┴───────────────────────────────┐
+     │               PostgreSQL                  │
+     │  - accounts (@Version + PESSIMISTIC_WRITE)│
+     │  - transactions                           │
+     │  - ledger_entries (DEBIT + CREDIT)        │
+     │  - outbox_events (PENDING)                │
+     └───────────────────┬───────────────────────┘
+                         │ (Poll com FOR UPDATE SKIP LOCKED)
+                         ▼
+              ┌─────────────────────┐
+              │   OutboxPublisher   │ ───► [RabbitMQ Exchange: coreledger.events]
+              └─────────────────────┘               │
+                                                    ▼
+                                         [Queue: coreledger.events.queue]
+                                         (DLQ: coreledger.events.dlq)
 ```
 
-### 1. Invariante Contábil de Partidas Dobradas
-- Toda movimentação financeira gera **obrigatoriamente** dois lançamentos atômicos no razão (`ledger_entries`):
-  - Um registro de `DEBIT` na conta de origem (valor negativo).
-  - Um registro de `CREDIT` na conta de destino (valor positivo).
-- O saldo só é modificado via lançamentos no razão contábil.
-- Valores armazenados exclusivamente em **centavos (`BIGINT`)** para eliminar imprecisões de ponto flutuante.
+---
 
-### 2. Controle de Idempotência Estrito (CA-02)
-- Interceptação via `@IdempotentEndpoint` e Spring AOP (`IdempotencyAspect`).
-- Chave gravada no Redis via `SETNX` com status `IN_PROGRESS`.
-- Requisições concorrentes com a mesma chave recebem **HTTP 409 Conflict**.
-- Requisições concluídas armazenam a resposta no Redis; reenvios recebem a resposta original cacheada com o header `Idempotent-Replayed: true`.
-- Erros de regra de negócio (HTTP 422) persistem o estado de falha para impedir reprocessamento espúrio. Falhas de infraestrutura deletam a chave para permitir retentativa.
+## 💻 Matriz Tecnológica
 
-### 3. Concorrência Extrema e Prevenção de Condições de Corrida (CA-03)
-- **Lock Distribuído** no Redis via **Redisson** ordenado lexicograficamente por UUID das contas para eliminar deadlocks cruzados (A→B vs B→A).
-- **Controle Otimista de Versão (`@Version`)** com retentativa transparente no `TransferOrchestrator`.
-- **Lock Pessimista (`PESSIMISTIC_WRITE`)** no PostgreSQL no momento da mutação.
-- Validação estrita de saldo insuficiente lançando `InsufficientBalanceException` (HTTP 422).
+| Componente | Tecnologia | Papel no CoreLedger |
+| :--- | :--- | :--- |
+| **Linguagem & Runtime** | Java 21 (LTS) | Virtual Threads (`threads.virtual.enabled=true`) |
+| **Framework Base** | Spring Boot 3.3.5 | Injeção de dependência, WebMVC e validação declarativa |
+| **Banco Relacional** | PostgreSQL 16 | Persistência transacional ACID |
+| **Migrações de Banco** | Flyway | Versionamento estrito e automatizado do schema |
+| **Cache & Distributed Lock** | Redis 7 + Redisson 3.37 | Chaves de idempotência (SETNX) e locks distribuídos por conta |
+| **Mensageria Assíncrona** | RabbitMQ 3.13 | Publicação outbox resiliente com Publisher Confirms e DLQ |
+| **Tolerância a Falhas** | Resilience4j 2.2 | Circuit Breaker, Retry exponencial e Timeout em chamadas externas |
+| **Segurança** | Spring Security + OAuth2 | Resource Server stateless, validação de escopos e RFC 7807 |
+| **Observabilidade** | Micrometer + Prometheus + OTel | Métricas de negócio, rastreamento W3C e logs em JSON |
+| **Documentação Interativa** | SpringDoc OpenAPI 2.6 | Swagger UI com suporte a autenticação Bearer JWT |
+| **Qualidade & Testes** | JUnit 5 + Mockito + Testcontainers | 36 testes unitários/fatia e suíte completa de integração |
 
-### 4. Resiliência com Circuit Breaker e Adquirente Externa (CA-05)
-- Integrado via **Resilience4j** (`acquirerGateway`):
-  - Janela deslizante de 20 chamadas, mínimo de 10 chamadas.
-  - Limiar de falha de 50%.
-  - Timeout de leitura de 2s e Retry com recuo exponencial.
-- Ao abrir o circuito, transições subsequentes retornam em **< 50ms** com resposta controlada (HTTP 503) e incremento da métrica `acquirer.fallback.total`.
+---
 
-### 5. Transactional Outbox Pattern e Mensageria Resiliente (RF-05, CA-06)
-- Eventos gravados na tabela `outbox_events` na mesma transação JDBC da movimentação.
-- `OutboxPublisher` consome lotes usando `FOR UPDATE SKIP LOCKED`, publica no RabbitMQ com **Publisher Confirms** e marca como `PROCESSED`.
-- Fila configurada com Dead Letter Exchange (`DLX`) e Dead Letter Queue (`DLQ`).
-- O `traceId` da requisição HTTP é persistido no evento e propagado até o MDC do consumidor no RabbitMQ.
+## 📡 Catálogo de Endpoints da API
 
-### 6. Segurança e Observabilidade (RNF-01, RNF-02, RNF-03)
-- **OAuth2 Resource Server** stateless com validação de escopos JWT:
-  - `SCOPE_payment:write` para endpoints de escrita (`/api/v1/transactions`, `/api/v1/accounts`).
-  - `SCOPE_ledger:read` para endpoints de auditoria e consulta (`/api/v1/ledger/**`, `/api/v1/accounts/**`).
-- Erros de segurança padronizados no padrão **RFC 7807 (Problem Details)**.
-- Logs estruturados em formato **JSON** via Logstash Logback Encoder contendo `traceId` e `spanId`.
-- Métricas expostas no endpoint do Actuator: `/actuator/prometheus`.
-- Documentação interativa Swagger UI com suporte a Bearer JWT em `/swagger-ui.html`.
+Todos os valores monetários trafegam e são persistidos estritamente em **centavos (`BIGINT`)** para evitar imprecisões de ponto flutuante.
+
+| Método | Endpoint | Escopo Exigido | Descrição |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/accounts` | `payment:write` | Cria uma nova conta bancária (com ou sem saldo inicial). |
+| `GET` | `/api/v1/accounts/{id}` | `ledger:read` | Consulta os dados e saldo consolidado da conta. |
+| `POST` | `/api/v1/transactions` | `payment:write` | Executa transferência por partidas dobradas (`Idempotency-Key` obrigatória). |
+| `GET` | `/api/v1/ledger/accounts/{id}/entries` | `ledger:read` | Consulta extrato contábil paginado por período. |
+| `GET` | `/api/v1/ledger/accounts/{id}/integrity` | `ledger:read` | Verifica se o saldo consolidado é idêntico à soma histórica do razão. |
+| `GET` | `/api/v1/auth/token` | *Público* | Emite token JWT para testes no Swagger (perfil dev). |
+| `GET` | `/actuator/prometheus` | *Público* | Métricas em formato Prometheus (`ledger_transactions_total`, etc.). |
+| `GET` | `/actuator/health` | *Público* | Sondas de saúde (`liveness` e `readiness`). |
 
 ---
 
 ## 🚀 Como Executar Localmente
 
 ### Pré-requisitos
-- **Java 21**
-- **Maven 3.9+**
+- **Java 21** instalado (`java -version`)
+- **Maven 3.9+** instalado (`mvn -v`)
 - **Docker** e **Docker Compose**
 
-### Passo 1: Subir a infraestrutura auxiliar (PostgreSQL, Redis, RabbitMQ)
+### 1. Iniciar os serviços auxiliares
+Suba o banco de dados PostgreSQL, o Redis e o RabbitMQ via Docker Compose:
 ```bash
 docker compose up -d
 ```
 
-### Passo 2: Compilar e executar a aplicação
+### 2. Iniciar a aplicação Spring Boot
 ```bash
 mvn spring-boot:run
 ```
+A aplicação iniciará na porta **`8080`**. As migrações do Flyway (`V1` e `V2`) são executadas automaticamente.
 
-A aplicação iniciará na porta `8080`. O Flyway executará as migrações automaticamente no PostgreSQL.
+---
 
-### Passo 3: Acessar a documentação Swagger
-Abra no navegador:
+## 🔑 Como Testar no Swagger UI (com JWT Local)
+
+A aplicação conta com um provedor de chaves RSA e gerador de JWT embutido para testes locais, **sem exigir a configuração de um servidor Keycloak externo**:
+
+1. Abra no navegador: **[`http://localhost:8080/swagger-ui.html`](http://localhost:8080/swagger-ui.html)**
+2. Localize a tag **"Autenticação (Desenvolvimento)"** e execute o endpoint:
+   ```
+   GET /api/v1/auth/token
+   ```
+   Ele retornará um JSON contendo o campo `access_token`.
+3. Copie o valor do token.
+4. No topo da página do Swagger, clique no botão **Authorize 🔓**, cole o token e confirme.
+5. Pronto! Agora você pode testar qualquer endpoint protegido diretamente pelo navegador.
+
+---
+
+## 💡 Exemplos Práticos com cURL
+
+### 1. Gerar Token JWT
+```bash
+TOKEN=$(curl -s "http://localhost:8080/api/v1/auth/token" | jq -r .access_token)
 ```
-http://localhost:8080/swagger-ui.html
+
+### 2. Criar Conta com Saldo Inicial de R$ 500,00 (50.000 centavos)
+```bash
+curl -X POST "http://localhost:8080/api/v1/accounts" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "holderName": "Alice Santos",
+    "accountNumber": "0001-9",
+    "initialBalanceCents": 50000
+  }'
+```
+
+### 3. Criar Segunda Conta com Saldo de R$ 100,00 (10.000 centavos)
+```bash
+curl -X POST "http://localhost:8080/api/v1/accounts" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "holderName": "Bob Souza",
+    "accountNumber": "0002-7",
+    "initialBalanceCents": 10000
+  }'
+```
+
+### 4. Transferir R$ 150,00 com Idempotência Estrita
+```bash
+curl -X POST "http://localhost:8080/api/v1/transactions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: TX-REQ-001" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceAccountId": "<UUID_DA_ALICE>",
+    "targetAccountId": "<UUID_DO_BOB>",
+    "amountCents": 15000,
+    "description": "Pagamento de serviços"
+  }'
+```
+> **Teste de Idempotência:** Repita a chamada acima com a mesma chave `TX-REQ-001`. A aplicação retornará a resposta cacheada instantaneamente com o cabeçalho `Idempotent-Replayed: true`, sem debitar a conta novamente.
+
+### 5. Verificar a Integridade Contábil da Conta
+```bash
+curl -X GET "http://localhost:8080/api/v1/ledger/accounts/<UUID_DA_ALICE>/integrity" \
+  -H "Authorization: Bearer $TOKEN"
+```
+Retorno:
+```json
+{
+  "accountId": "...",
+  "balanceCents": 35000,
+  "ledgerSumCents": 35000,
+  "consistent": true
+}
 ```
 
 ---
 
-## 🧪 Suíte de Testes
+## 🛡️ Pilares de Engenharia & Decisões de Design
 
-A aplicação segue a pirâmide de testes com três camadas:
+### 1. Invariante de Partidas Dobradas e Soma Zero Global
+Nenhum saldo é alterado diretamente. Toda operação gera pelo menos um lançamento de `DEBIT` (-X centavos) e um lançamento de `CREDIT` (+X centavos) vinculados ao mesmo `transaction_id`.
+Mesmo a criação de contas com saldo inicial debita a conta de **Tesouraria Central** (`00000000-0000-0000-0000-000000000000`), garantindo que **a soma global de todo o razão seja rigorosamente igual a zero**.
 
-1. **Testes Unitários de Domínio (`AccountTest`)**:
-   - Validação de débito/crédito, integridade de soma zero e rejeição de valores negativos ou zerados (< 50ms).
-2. **Testes de Fatia Web e Segurança (`TransactionControllerWebTest`)**:
-   - Validação de escopos OAuth2 com `@WebMvcTest` + `spring-security-test`.
-   - Verifica retornos HTTP 401 (sem token), 403 (escopo inválido), 400 (payload incorreto), 201 (sucesso) e 422 (saldo insuficiente).
-3. **Testes de Integração com Infraestrutura Real (`CoreLedgerIT`)**:
-   - Usa **Testcontainers** inicializando containers reais de PostgreSQL, Redis e RabbitMQ.
-   - **CA-01**: Partidas dobradas e evento Outbox.
-   - **CA-02**: Idempotência estrita e reenvios cacheados.
-   - **CA-03**: Concorrência extrema com **50 threads simultâneas** disputando a mesma conta (5 sucessos, 45 rejeições, saldo zerado).
-   - **CA-04**: Segurança OAuth2 e integridade de dados.
-   - **CA-05**: Circuit Breaker abrindo sob falhas da adquirente simulada com WireMock.
-   - **CA-06**: Publicação no RabbitMQ, consumo com propagação de traceId e exportação de métricas para o Prometheus.
+### 2. Idempotência em Duas Fases via Redis
+- Interceptação com Spring AOP (`@IdempotentEndpoint`).
+- Comando atômico `SETNX` no Redis com status `IN_PROGRESS` e TTL de 24h.
+- Requisições concorrentes idênticas recebem `HTTP 409 Conflict`.
+- Requisições concluídas armazenam a resposta; reenvios recebem o resultado original em cache.
+- Falhas de negócio persistem `FAILED` (retornando `HTTP 422`); falhas transitórias de infraestrutura limpam a chave para permitir nova tentativa.
 
-Para rodar os testes unitários e de fatia:
+### 3. Eliminação de Deadlocks e Concorrência de Alta Performance
+- **Redisson Distributed Lock**: Contas são travadas ordenadas lexicograficamente por UUID para impedir deadlocks em transferências cruzadas simultâneas (A→B e B→A).
+- **Controle Otimista (`@Version`)**: Retentativas transparentes no caso de concorrência massiva.
+- **Lock Pessimista (`PESSIMISTIC_WRITE`)**: Bloqueio em nível de linha no PostgreSQL durante o débito/crédito.
+
+### 4. Transactional Outbox Pattern e Dead-Lettering
+- O evento de domínio é inserido na tabela `outbox_events` na mesma transação JDBC da movimentação financeira.
+- Um poller agendado lê lotes usando `FOR UPDATE SKIP LOCKED`, publica no RabbitMQ com **Publisher Confirms** e marca como `PROCESSED`.
+- Em caso de falha consecutiva, o evento possui limite de retentativas (`coreledger.outbox.max-retries`), sendo marcado como `FAILED` após atingir o teto para evitar bloqueio do lote, além de DLQ no RabbitMQ.
+
+### 5. Resiliência com Circuit Breaker
+- A comunicação com adquirentes externas (`AcquirerGatewayClient`) é protegida por Circuit Breaker e Retry com recuo exponencial.
+- Ao registrar taxa de falha $\ge 50\%$, o circuito transita para `OPEN`, degradando em menos de 50ms com `HTTP 503` e preservando as threads da aplicação.
+
+### 6. Rastreamento e Logs Estruturados
+- Logs gerados no formato JSON (Logstash Encoder) contendo `traceId` e `spanId`.
+- O `traceId` é persistido no evento outbox e propagado até o MDC do consumidor no RabbitMQ.
+
+---
+
+## 🧪 Estratégia e Execução de Testes
+
+### 1. Testes Unitários e de Fatia (Execução Rápida, sem Docker)
+Cobrem todas as regras de negócio, AOP, segurança, serialização e tolerância a falhas:
 ```bash
 mvn test
 ```
+**Resultado:** **36 testes automatizados, 100% aprovados em ~9 segundos.**
 
-Para rodar a suíte completa de integração (requer Docker rodando para o Testcontainers):
+### 2. Testes de Integração com Containers Reais (`CoreLedgerIT.java`)
+Cenários ponta a ponta validados via **Testcontainers** (requer Docker ativo):
+- **CA-01 (Partidas Dobradas):** Gravação de débitos/créditos e evento no banco real.
+- **CA-02 (Idempotência Estrita):** Resposta em cache e bloqueio de concorrência com Redis real.
+- **CA-03 (Concorrência Extrema):** **50 threads simultâneas** disputando uma conta (5 sucessos de R$ 20,00 e 45 rejeições por saldo insuficiente; saldo final exato de R$ 0,00).
+- **CA-04 (Segurança):** Bloqueio de chamadas não autenticadas (401) ou com escopo insuficiente (403).
+- **CA-05 (Circuit Breaker):** Interrupção de chamadas de rede e fallback < 150ms via WireMock.
+- **CA-06 (Observabilidade):** Validação de métricas em `/actuator/prometheus` e consumo assíncrono via RabbitMQ.
+
+Com o Docker ativo, execute:
 ```bash
 mvn clean verify
 ```
