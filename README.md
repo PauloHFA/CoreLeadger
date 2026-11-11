@@ -247,3 +247,11 @@ Com o Docker ativo, execute:
 ```bash
 mvn clean verify
 ```
+
+---
+
+## 👤 Autor & Contribuidor Principal
+
+- **Paulo Henrique** — [@PauloHFA](https://github.com/PauloHFA)
+- **E-mail:** [rickphtb@gmail.com](mailto:rickphtb@gmail.com)
+

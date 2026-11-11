@@ -16,6 +16,18 @@
     <name>coreledger-engine</name>
     <description>Motor distribuído de pagamentos e conciliação contábil</description>
 
+    <developers>
+        <developer>
+            <id>PauloHFA</id>
+            <name>Paulo</name>
+            <email>rickphtb@gmail.com</email>
+            <roles>
+                <role>Lead Architect</role>
+                <role>Principal Developer</role>
+            </roles>
+        </developer>
+    </developers>
+
     <properties>
         <java.version>21</java.version>
         <springdoc.version>2.6.0</springdoc.version>
